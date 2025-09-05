@@ -6,7 +6,6 @@ WIDTH, HEIGHT = 900, 520
 
 WHITE = (255, 255, 255)
 BLACK = (18, 18, 18)
-GREY = (220, 220, 220)
 BROWN = (120, 70, 20)
 BROWN_DARK = (85, 50, 15)
 BROWN_LIGHT = (160, 95, 30)
@@ -16,6 +15,11 @@ SKY_TOP = (210, 230, 255)
 SKY_BOTTOM = (160, 200, 255)
 GROUND_TOP = (150, 200, 150)
 GROUND_BOTTOM = (110, 170, 110)
+
+LEAF_D1 = (70, 160, 70)
+LEAF_D2 = (50, 140, 60)
+LEAF_L1 = (120, 200, 110)
+LEAF_L2 = (100, 185, 100)
 
 APPLE_RED = (225, 55, 55)
 APPLE_RED_D = (175, 35, 35)
@@ -38,7 +42,8 @@ DEFAULT_STEP_INTERVAL_MS = 600
 _PENDING_DEFAULTS = {
     "distance_px": 300.0,
     "steps_per_sec": 1000.0 / DEFAULT_STEP_INTERVAL_MS,  # ~1.67
-    "stop_distance_px": 0.5
+    "stop_distance_px": 0.5,
+    "step_ratio": 0.50  # 50% par étape par défaut
 }
 APP_INSTANCE = None  # référence globale de l'app (pour setters externes)
 
@@ -113,7 +118,7 @@ class Button:
 class Slider:
     """
     Slider discret: si step est défini, on 'snap' aux crans.
-    Garantit que l'extrémité gauche = vmin (ex: 0.01) est atteignable.
+    Garantit que l'extrémité gauche atteint vmin (utile pour ε=0.01).
     self.y = axe vertical de la piste (centre)
     """
     def __init__(self, x, y, w, vmin, vmax, value, step=None):
@@ -142,7 +147,6 @@ class Slider:
     def _snap(self, v):
         v = clamp(v, self.vmin, self.vmax)
         if self.N is not None:
-            # Convertit valeur -> cran entier, puis cran -> valeur exacte
             k = int(round((v - self.vmin) / (self.vmax - self.vmin) * self.N))
             k = clamp(k, 0, self.N)
             return self.vmin + k * (self.vmax - self.vmin) / self.N
@@ -280,10 +284,11 @@ class ZenonApp:
         self.apple_y = float(self.trunk_rect.centery)
         self.target_x = float(self.trunk_rect.left)
 
-        # Paramètres (distance, vitesse, epsilon)
+        # Paramètres (distance, vitesse, epsilon, ratio)
         self.chosen_distance = 300.0
         self.step_interval = DEFAULT_STEP_INTERVAL_MS
         self.stop_epsilon = 0.5
+        self.step_ratio = 0.50  # fraction de distance par étape (0.01..0.99)
         self.apply_pending_defaults()
 
         # État simulation
@@ -318,17 +323,43 @@ class ZenonApp:
         self.settings_open = False
         self._build_settings_ui()
 
-        # Fond pré-rendu
+        # Fonds pré-rendus
         self.background = pygame.Surface((WIDTH, HEIGHT))
         self._render_background(self.background)
+        self.foliage_surface = self._render_foliage()  # cime feuillue
 
-        self.inputs = [self.in_distance, self.in_speed, self.in_epsilon]
+        self.inputs = [self.in_distance, self.in_speed, self.in_epsilon, self.in_ratio]
         self.focus_index = -1
 
     # ---------- Helpers ----------
     def _render_background(self, surf):
         draw_vertical_gradient(surf, (0, 0, WIDTH, self.ground_y), SKY_TOP, SKY_BOTTOM)
         draw_vertical_gradient(surf, (0, self.ground_y, WIDTH, HEIGHT - self.ground_y), GROUND_TOP, GROUND_BOTTOM)
+
+    def _render_foliage(self):
+        # Crée une cime feuillue (Surface) centrée au-dessus du tronc
+        crown_w = 200
+        crown_h = 140
+        s = pygame.Surface((crown_w, crown_h), pygame.SRCALPHA)
+        cx = crown_w // 2
+        cy = crown_h // 2 + 10
+
+        # Couches de feuilles (cercles) avec alpha, pour un rendu doux
+        layers = [
+            (LEAF_D2, 80, 0.55),
+            (LEAF_D1, 70, 0.45),
+            (LEAF_L2, 62, 0.35),
+            (LEAF_L1, 52, 0.25),
+        ]
+        for col, base_r, a in layers:
+            alpha_col = (col[0], col[1], col[2], int(255 * a))
+            for dx, dy, sc in [(-30, -18, 1.00), (30, -12, 0.95), (-45, 10, 0.85), (40, 15, 0.90), (0, 0, 1.05)]:
+                pygame.draw.circle(s, alpha_col, (cx + dx, cy + dy), int(base_r * sc))
+        # Petites touches de clairsemé
+        for dx, dy, r in [(-70, -10, 14), (70, -8, 12), (0, -30, 10), (-30, 30, 12), (35, 26, 10)]:
+            pygame.draw.circle(s, (255, 255, 255, 30), (cx + dx, cy + dy), r)
+
+        return s
 
     def valid_distance_range(self):
         return 10.0, (self.target_x - (APPLE_RADIUS + 12))
@@ -370,7 +401,8 @@ class ZenonApp:
         dmin, dmax = self.valid_distance_range()
         self.chosen_distance = clamp(float(_PENDING_DEFAULTS["distance_px"]), dmin, dmax)
         self.step_interval = self.interval_from_sps(float(_PENDING_DEFAULTS["steps_per_sec"]))
-        self.stop_epsilon = float(_PENDING_DEFAULTS["stop_distance_px"])
+        self.stop_epsilon = max(0.01, float(_PENDING_DEFAULTS["stop_distance_px"]))
+        self.step_ratio = clamp(float(_PENDING_DEFAULTS["step_ratio"]), 0.01, 0.99)
 
     # ---------- Réglages UI (sans chevauchement) ----------
     def _build_settings_ui(self):
@@ -394,31 +426,35 @@ class ZenonApp:
         row1_y = top_y
         row2_y = row1_y + row_gap
         row3_y = row2_y + row_gap
+        row4_y = row3_y + row_gap
 
         # Plages sliders
         dmin, dmax = self.valid_distance_range()
 
         # Sliders (y au dessous des inputs)
-        self.sld_distance = Slider(base_x, row1_y + input_h + 12, track_w, dmin, dmax, clamp(_PendingOrDefault("distance_px", 300.0), dmin, dmax), step=1.0)
+        self.sld_distance = Slider(base_x, row1_y + input_h + 12, track_w, dmin, dmax, self.chosen_distance, step=1.0)
         self.sld_speed    = Slider(base_x, row2_y + input_h + 12, track_w, 0.2, 20.0, max(0.2, self.steps_per_second()), step=0.1)
-        # ε: min 0.01, step 0.01 (discret)
-        self.sld_epsilon  = Slider(base_x, row3_y + input_h + 12, track_w, 0.01, 20.0, max(0.01, _PendingOrDefault("stop_distance_px", 0.5)), step=0.01)
+        self.sld_epsilon  = Slider(base_x, row3_y + input_h + 12, track_w, 0.01, 20.0, max(0.01, self.stop_epsilon), step=0.01)
+        # Pas en pourcentage: 1..99 %
+        self.sld_ratio    = Slider(base_x, row4_y + input_h + 12, track_w, 1.0, 99.0, self.step_ratio * 100.0, step=1.0)
 
-        # Inputs
+        # Inputs alignés à droite
         self.in_distance = TextInput((in_x, row1_y, input_w, input_h), self.font, placeholder="px", value=f"{self.chosen_distance:.1f}")
         self.in_speed    = TextInput((in_x, row2_y, input_w, input_h), self.font, placeholder="étapes/s", value=f"{self.steps_per_second():.2f}")
         self.in_epsilon  = TextInput((in_x, row3_y, input_w, input_h), self.font, placeholder="ε (px)", value=f"{self.stop_epsilon:.2f}")
+        self.in_ratio    = TextInput((in_x, row4_y, input_w, input_h), self.font, placeholder="% par étape", value=f"{self.step_ratio*100:.0f}")
 
         # Libellés
         self._rows = [
             ("Distance initiale (px)", row1_y),
             ("Vitesse (étapes/s)", row2_y),
-            ("Distance d'arrêt ε (px)", row3_y)
+            ("Distance d'arrêt ε (px)", row3_y),
+            ("Pas (% de distance/étape)", row4_y)
         ]
 
-        # Boutons sous le dernier slider
+        # Boutons sous le dernier slider (position dynamique)
         b_w, b_h = 120, 34
-        below_last_slider = self.sld_epsilon.y + self.sld_epsilon.knob_r + 20
+        below_last_slider = self.sld_ratio.y + self.sld_ratio.knob_r + 20
         x1 = self.settings_rect.right - (b_w + 20)
         x0 = x1 - (b_w + 10)
         yb = int(below_last_slider + 12)
@@ -447,8 +483,12 @@ class ZenonApp:
             self.sld_epsilon.value = max(0.01, self.stop_epsilon)
             self.in_epsilon.set_value(self.sld_epsilon.value, fmt="{:.2f}")
 
+            self.sld_ratio.set_range(1.0, 99.0, step=1.0)
+            self.sld_ratio.value = clamp(self.step_ratio * 100.0, 1.0, 99.0)
+            self.in_ratio.set_value(self.sld_ratio.value, fmt="{:.0f}")
+
             self.focus_index = -1
-            for inp in [self.in_distance, self.in_speed, self.in_epsilon]:
+            for inp in [self.in_distance, self.in_speed, self.in_epsilon, self.in_ratio]:
                 inp.active = False
 
     def apply_settings(self):
@@ -467,9 +507,15 @@ class ZenonApp:
         if eps_val is None or eps_val <= 0: eps_val = self.sld_epsilon.value
         eps_val = clamp(eps_val, 0.01, 1000.0)  # min 0.01
 
+        ratio_pct = self.in_ratio.get_value()
+        if ratio_pct is None or ratio_pct <= 0: ratio_pct = self.sld_ratio.value
+        ratio_pct = clamp(ratio_pct, 1.0, 99.0)
+        ratio = ratio_pct / 100.0
+
         self.chosen_distance = d_val
         self.step_interval = self.interval_from_sps(sps_val)
         self.stop_epsilon = eps_val
+        self.step_ratio = ratio
 
         # Resync affichage
         self.sld_distance.value = self.chosen_distance
@@ -478,18 +524,22 @@ class ZenonApp:
         self.in_speed.set_value(sps_val, fmt="{:.2f}")
         self.sld_epsilon.value = self.stop_epsilon
         self.in_epsilon.set_value(self.stop_epsilon, fmt="{:.2f}")
+        self.sld_ratio.value = self.step_ratio * 100.0
+        self.in_ratio.set_value(self.sld_ratio.value, fmt="{:.0f}")
 
         self.reset()
         self.settings_open = False
 
     # ---------- API publique ----------
-    def set_parameters(self, distance_px=None, steps_per_sec=None, stop_distance_px=None, reset_view=True):
+    def set_parameters(self, distance_px=None, steps_per_sec=None, stop_distance_px=None, step_ratio=None, reset_view=True):
         if distance_px is not None:
             self.chosen_distance = clamp(float(distance_px), *self.valid_distance_range())
         if steps_per_sec is not None:
             self.step_interval = self.interval_from_sps(float(steps_per_sec))
         if stop_distance_px is not None:
             self.stop_epsilon = max(0.01, float(stop_distance_px))  # min 0.01
+        if step_ratio is not None:
+            self.step_ratio = clamp(float(step_ratio), 0.01, 0.99)
         if reset_view:
             self.reset()
 
@@ -498,7 +548,9 @@ class ZenonApp:
         if self.reached:
             return
         prev_x = self.apple_x
-        self.apple_x = 0.5 * (self.apple_x + self.target_x)  # moitié de la distance restante
+        # Mouvement: x <- x + r * (target - x)
+        r = self.step_ratio
+        self.apple_x = self.apple_x + r * (self.target_x - self.apple_x)
         self.last_step_delta = abs(self.apple_x - prev_x)
         self.total_travel += self.last_step_delta
         self.step_count += 1
@@ -510,27 +562,30 @@ class ZenonApp:
         r = self.trunk_rect
         trunk_surf = pygame.Surface((r.w, r.h), pygame.SRCALPHA)
         draw_vertical_gradient(trunk_surf, (0, 0, r.w, r.h), BROWN_LIGHT, BROWN_DARK)
-        pygame.draw.rect(trunk_surf, (255, 255, 255, 25), (0, 0, 6, r.h))
-        pygame.draw.rect(trunk_surf, (0, 0, 0, 30), (r.w - 6, 0, 6, r.h))
+        pygame.draw.rect(trunk_surf, (255, 255, 255, 25), (0, 0, 6, r.h))       # éclat gauche
+        pygame.draw.rect(trunk_surf, (0, 0, 0, 30), (r.w - 6, 0, 6, r.h))       # ombre droite
         surface.blit(trunk_surf, r.topleft)
         pygame.draw.ellipse(surface, (0, 0, 0, 40), (r.centerx - r.w, r.bottom - 6, 2*r.w, 12))
+
+        # Feuillage (cime) centré au-dessus du tronc
+        crown_x = r.centerx - self.foliage_surface.get_width() // 2
+        crown_y = r.top - self.foliage_surface.get_height() + 20
+        surface.blit(self.foliage_surface, (crown_x, crown_y))
 
     def draw_apple(self, surface):
         x, y = int(self.apple_x), int(self.apple_y)
         # Ombre portée
         shadow = pygame.Surface((APPLE_RADIUS*4, APPLE_RADIUS*4), pygame.SRCALPHA)
         pygame.draw.circle(shadow, (0, 0, 0, 70), (APPLE_RADIUS*2, APPLE_RADIUS*2), APPLE_RADIUS + 2)
-        # CORRECTION: passer une position (tuple) et non deux entiers séparés
-        surface.blit(shadow, (x - (APPLE_RADIUS*2) + 3, y - (APPLE_RADIUS*2) + 3))
+        surface.blit(shadow, (x - (APPLE_RADIUS*2) + 3, y - (APPLE_RADIUS*2) + 3))  # CORRECT: un seul tuple (x, y)
         # Corps de la pomme
         pygame.draw.circle(surface, APPLE_RED_D, (x, y), APPLE_RADIUS + 2)
         pygame.draw.circle(surface, APPLE_RED, (x, y), APPLE_RADIUS)
         # Reflet
         pygame.draw.circle(surface, (255, 255, 255, 160), (x - 5, y - 5), 5)
-        
 
     def draw_hud(self):
-        info_rect = pygame.Rect(16, 12, 380, 170)
+        info_rect = pygame.Rect(16, 12, 420, 190)
         draw_rounded_panel(self.screen, info_rect, PANEL_BG, radius=10)
         d_remain = self.remaining_distance()
         lines = [
@@ -541,7 +596,7 @@ class ZenonApp:
             f"Distance parcourue (totale): {self.total_travel:.3f}px",
             f"Distance restante: {d_remain:.3f}px",
             f"Vitesse: {self.steps_per_second():.2f} étapes/s (Δ: {self.step_interval} ms)",
-            f"ε (arrêt): {self.stop_epsilon:.2f}px",
+            f"Pas r: {self.step_ratio*100:.0f} %  •  ε (arrêt): {self.stop_epsilon:.2f}px",
         ]
         draw_lines(self.screen, lines, (info_rect.x + 12, info_rect.y + 10), BLACK, self.font, vspace=2)
 
@@ -552,7 +607,7 @@ class ZenonApp:
                          (int(self.target_x), int(self.apple_y)), 2)
 
         if self.reached:
-            msg_rect = pygame.Rect(16, info_rect.bottom + 10, 460, 64)
+            msg_rect = pygame.Rect(16, info_rect.bottom + 10, 520, 64)
             draw_rounded_panel(self.screen, (msg_rect), (255, 250, 220), radius=10)
             draw_lines(self.screen, [
                 "Fin: seuil d'arrêt atteint.",
@@ -569,6 +624,7 @@ class ZenonApp:
             (self._rows[0], self.in_distance, self.sld_distance),
             (self._rows[1], self.in_speed,    self.sld_speed),
             (self._rows[2], self.in_epsilon,  self.sld_epsilon),
+            (self._rows[3], self.in_ratio,    self.sld_ratio),
         ]:
             self.screen.blit(self.font.render(label, True, BLACK), (self.settings_rect.x + 20, y))
             input_widget.draw(self.screen)
@@ -584,7 +640,7 @@ class ZenonApp:
             dt = self.clock.tick(60)
 
             if self.settings_open:
-                for inp in [self.in_distance, self.in_speed, self.in_epsilon]:
+                for inp in [self.in_distance, self.in_speed, self.in_epsilon, self.in_ratio]:
                     inp.update(dt)
 
             for event in pygame.event.get():
@@ -623,6 +679,8 @@ class ZenonApp:
                         self.in_speed.set_value(self.sld_speed.value, fmt="{:.2f}")
                     if self.sld_epsilon.handle_event(event):
                         self.in_epsilon.set_value(self.sld_epsilon.value, fmt="{:.2f}")
+                    if self.sld_ratio.handle_event(event):
+                        self.in_ratio.set_value(self.sld_ratio.value, fmt="{:.0f}")
 
                     # Inputs (Entrée = commit → Appliquer tout)
                     committed = False
@@ -639,11 +697,17 @@ class ZenonApp:
                     if self.in_epsilon.handle_event(event):
                         val = self.in_epsilon.get_value()
                         if val is not None and val > 0:
-                            # Snap et clamp min 0.01
-                            self.sld_epsilon.value = max(0.01, val)
+                            self.sld_epsilon.value = clamp(val, 0.01, 1000.0)  # min 0.01
                             self.sld_epsilon.value = self.sld_epsilon._snap(self.sld_epsilon.value)
                             self.in_epsilon.set_value(self.sld_epsilon.value, fmt="{:.2f}")
                         committed = True
+                    if self.in_ratio.handle_event(event):
+                        val = self.in_ratio.get_value()
+                        if val is not None and val > 0:
+                            self.sld_ratio.value = clamp(val, 1.0, 99.0)
+                            self.in_ratio.set_value(self.sld_ratio.value, fmt="{:.0f}")
+                        committed = True
+
                     if committed:
                         self.apply_settings()
 
@@ -662,9 +726,10 @@ class ZenonApp:
                     self.last_step_time = now
 
             # ---- Rendu global ----
+            self.screen.fill(WHITE)
             self.screen.blit(self.background, (0, 0))
             pygame.draw.line(self.screen, (120, 160, 120), (0, self.ground_y), (WIDTH, self.ground_y), 2)
-            self.draw_trunk(self.screen)
+            self.draw_trunk(self.screen)   # tronc + feuillage
             self.draw_apple(self.screen)
             self.draw_hud()
             if self.settings_open:
@@ -674,15 +739,11 @@ class ZenonApp:
         pygame.quit()
         sys.exit()
 
-# ------------------ Helpers internes ------------------
-def _PendingOrDefault(key, default):
-    return _PENDING_DEFAULTS.get(key, default)
-
 # ------------------ Fonctions publiques ------------------
-def set_parameters(distance_px=None, steps_per_sec=None, stop_distance_px=None):
+def set_parameters(distance_px=None, steps_per_sec=None, stop_distance_px=None, step_ratio=None):
     global APP_INSTANCE, _PENDING_DEFAULTS
     if APP_INSTANCE is not None:
-        APP_INSTANCE.set_parameters(distance_px, steps_per_sec, stop_distance_px, reset_view=True)
+        APP_INSTANCE.set_parameters(distance_px, steps_per_sec, stop_distance_px, step_ratio, reset_view=True)
     else:
         if distance_px is not None:
             _PENDING_DEFAULTS["distance_px"] = float(distance_px)
@@ -690,9 +751,12 @@ def set_parameters(distance_px=None, steps_per_sec=None, stop_distance_px=None):
             _PENDING_DEFAULTS["steps_per_sec"] = float(steps_per_sec)
         if stop_distance_px is not None:
             _PENDING_DEFAULTS["stop_distance_px"] = float(stop_distance_px)
+        if step_ratio is not None:
+            _PENDING_DEFAULTS["step_ratio"] = float(step_ratio)
 
 def set_distance_and_speed(distance_px=None, steps_per_sec=None):
-    set_parameters(distance_px=distance_px, steps_per_sec=steps_per_sec, stop_distance_px=None)
+    # Compatibilité ancienne API
+    set_parameters(distance_px=distance_px, steps_per_sec=steps_per_sec)
 
 def main():
     global APP_INSTANCE
